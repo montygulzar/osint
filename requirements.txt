@@ -1,0 +1,5 @@
+requests>=2.31
+dnspython>=2.4
+python-whois>=0.9
+phonenumbers>=8.13
+colorama>=0.4 ; sys_platform == "win32"
