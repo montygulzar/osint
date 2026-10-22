@@ -4,14 +4,36 @@ single-file osint toolkit. no paid API keys, no signup. uses only public free so
 
 ## install (one-liner)
 
+venv-based so it works on modern python (bypasses PEP 668 "externally-managed-environment"):
+
 ```bash
-git clone https://github.com/montygulzar/osint.git && cd osint && pip install -r requirements.txt && chmod +x osint.py
+git clone https://github.com/montygulzar/osint.git && cd osint && python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt && chmod +x osint.py && echo "done — run: ./osint.py --help"
 ```
 
-or into a venv:
+then every new shell, before using it:
 
 ```bash
-python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt && chmod +x osint.py
+cd osint && . .venv/bin/activate
+```
+
+### windows (powershell)
+
+```powershell
+git clone https://github.com/montygulzar/osint.git; cd osint; python -m venv .venv; .\.venv\Scripts\Activate.ps1; pip install -r requirements.txt
+python osint.py --help
+```
+
+### if you really want it system-wide (not recommended)
+
+```bash
+pip install --break-system-packages -r requirements.txt
+```
+
+### smoke test
+
+```bash
+./osint.py discord 80351110224678912   # offline snowflake decode — no network needed
+./osint.py github torvalds             # verifies network path
 ```
 
 ## usage
