@@ -47,6 +47,15 @@ except ImportError:
     sys.stderr.write("missing dep: pip install requests\n")
     sys.exit(1)
 
+# windows ANSI color: use colorama if available, else strip color codes
+_USE_COLOR = True
+if sys.platform == "win32":
+    try:
+        import colorama  # type: ignore
+        colorama.just_fix_windows_console()
+    except ImportError:
+        _USE_COLOR = False
+
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 osint.py/1.0"
 HEADERS = {"User-Agent": UA, "Accept": "*/*"}
 TIMEOUT = 10
@@ -56,16 +65,19 @@ S.headers.update(HEADERS)
 
 # ---------- output helpers ----------
 
-class C:
-    R = "\033[0m"
-    B = "\033[1m"
-    DIM = "\033[2m"
-    RED = "\033[31m"
-    GRN = "\033[32m"
-    YEL = "\033[33m"
-    BLU = "\033[34m"
-    MAG = "\033[35m"
-    CYN = "\033[36m"
+class _ColorOn:
+    R = "\033[0m"; B = "\033[1m"; DIM = "\033[2m"
+    RED = "\033[31m"; GRN = "\033[32m"; YEL = "\033[33m"
+    BLU = "\033[34m"; MAG = "\033[35m"; CYN = "\033[36m"
+
+
+class _ColorOff:
+    R = ""; B = ""; DIM = ""
+    RED = ""; GRN = ""; YEL = ""
+    BLU = ""; MAG = ""; CYN = ""
+
+
+C = _ColorOn if _USE_COLOR else _ColorOff
 
 
 def banner(title: str) -> None:
@@ -509,23 +521,33 @@ def discord_user_scan(user_id: str) -> dict[str, Any]:
 
     out["snowflake"] = decode_snowflake(sf)
 
-    # discordlookup.mesalytic.moe — public, no auth, swatted-style
-    try:
-        r = S.get(f"https://discordlookup.mesalytic.moe/v1/user/{sf}", timeout=TIMEOUT)
-        if r.status_code == 200:
-            data = r.json()
-            out["lookup"] = data
-            # decode badge flags if present
-            flags = (data.get("badges") or {}).get("flags")
-            if isinstance(flags, int):
-                out["badges_decoded"] = _decode_flags(flags)
-            pub = data.get("public_flags")
-            if isinstance(pub, int):
-                out["public_flags_decoded"] = _decode_flags(pub)
-        else:
-            out["lookup_error"] = f"status {r.status_code}"
-    except Exception as e:
-        out["lookup_error"] = str(e)
+    # try a chain of public discord lookup endpoints — all no-auth
+    LOOKUP_URLS = [
+        f"https://discordlookup.mesalytic.moe/v1/user/{sf}",
+        f"https://discord-lookup-api.vercel.app/v1/user/{sf}",
+    ]
+    for url in LOOKUP_URLS:
+        try:
+            r = S.get(url, timeout=TIMEOUT)
+            if r.status_code == 200:
+                data = r.json()
+                out["lookup"] = data
+                out["lookup_source"] = url
+                flags = (data.get("badges") or {}).get("flags")
+                if isinstance(flags, int):
+                    out["badges_decoded"] = _decode_flags(flags)
+                pub = data.get("public_flags")
+                if isinstance(pub, int):
+                    out["public_flags_decoded"] = _decode_flags(pub)
+                break
+            else:
+                out.setdefault("lookup_errors", []).append(f"{url} -> status {r.status_code}")
+        except Exception as e:
+            out.setdefault("lookup_errors", []).append(f"{url} -> {type(e).__name__}: {e}")
+    if "lookup" not in out:
+        warn("no public lookup endpoint reachable — snowflake decode above is still valid")
+        warn("if this persists, try: `nslookup discordlookup.mesalytic.moe 1.1.1.1`"
+             " (local DNS may be blocking the host)")
 
     # lanyard — presence if user is in the lanyard guild
     try:
@@ -760,8 +782,8 @@ def print_discord(d: dict) -> None:
         if la.get("spotify"):
             sp = la["spotify"]
             hit(f"spotify: {sp.get('song')} — {sp.get('artist')}")
-    if d.get("lookup_error"):
-        warn(d["lookup_error"])
+    for e in d.get("lookup_errors") or []:
+        warn(e)
 
 
 def print_discord_invite(d: dict) -> None:
@@ -819,6 +841,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(prog="osint",
         description="free osint toolkit — no paid keys")
     ap.add_argument("--json", action="store_true", help="json output")
+    ap.add_argument("--no-color", action="store_true", help="disable ANSI colors")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     for name in ("username", "email", "domain", "ip", "phone", "github"):
@@ -838,6 +861,10 @@ def main() -> int:
     al.add_argument("target")
 
     args = ap.parse_args()
+
+    if args.no_color:
+        global C
+        C = _ColorOff
 
     dispatch = {
         "username": lambda: ("username", username_scan(args.target)),
