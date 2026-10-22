@@ -21,6 +21,8 @@ usage:
   ./osint.py ip 1.1.1.1
   ./osint.py phone +15551234567
   ./osint.py github torvalds
+  ./osint.py discord 80351110224678912
+  ./osint.py discord-invite discord-developers
   ./osint.py wayback example.com --limit 20
   ./osint.py all target@example.com      # auto-dispatch by shape
 
@@ -450,6 +452,116 @@ def github_scan(user: str) -> dict[str, Any]:
     return out
 
 
+# ---------- discord ----------
+# snowflake epoch (discord): 2015-01-01T00:00:00Z = 1420070400000 ms
+
+DISCORD_EPOCH = 1420070400000
+
+DISCORD_BADGE_FLAGS = {
+    1 << 0:  "Discord Employee",
+    1 << 1:  "Partnered Server Owner",
+    1 << 2:  "HypeSquad Events",
+    1 << 3:  "Bug Hunter Level 1",
+    1 << 6:  "HypeSquad Bravery",
+    1 << 7:  "HypeSquad Brilliance",
+    1 << 8:  "HypeSquad Balance",
+    1 << 9:  "Early Supporter",
+    1 << 10: "Team User",
+    1 << 14: "Bug Hunter Level 2",
+    1 << 16: "Verified Bot",
+    1 << 17: "Early Verified Bot Developer",
+    1 << 18: "Moderator Programs Alumni",
+    1 << 19: "Bot HTTP Interactions",
+    1 << 22: "Active Developer",
+}
+
+
+def decode_snowflake(snowflake: int) -> dict[str, Any]:
+    """decode any discord snowflake (user, guild, channel, message) -> metadata."""
+    ms_since_epoch = (snowflake >> 22)
+    unix_ms = ms_since_epoch + DISCORD_EPOCH
+    worker_id = (snowflake & 0x3E0000) >> 17
+    process_id = (snowflake & 0x1F000) >> 12
+    increment = snowflake & 0xFFF
+    import datetime as _dt
+    created = _dt.datetime.fromtimestamp(unix_ms / 1000, tz=_dt.timezone.utc)
+    return {
+        "snowflake": snowflake,
+        "created_at": created.isoformat(),
+        "created_unix": unix_ms // 1000,
+        "worker_id": worker_id,
+        "process_id": process_id,
+        "increment": increment,
+    }
+
+
+def _decode_flags(flags: int) -> list[str]:
+    return [name for bit, name in DISCORD_BADGE_FLAGS.items() if flags & bit]
+
+
+def discord_user_scan(user_id: str) -> dict[str, Any]:
+    out: dict[str, Any] = {"id": user_id}
+    try:
+        sf = int(user_id)
+    except ValueError:
+        out["error"] = "not a numeric snowflake"
+        return out
+
+    out["snowflake"] = decode_snowflake(sf)
+
+    # discordlookup.mesalytic.moe — public, no auth, swatted-style
+    try:
+        r = S.get(f"https://discordlookup.mesalytic.moe/v1/user/{sf}", timeout=TIMEOUT)
+        if r.status_code == 200:
+            data = r.json()
+            out["lookup"] = data
+            # decode badge flags if present
+            flags = (data.get("badges") or {}).get("flags")
+            if isinstance(flags, int):
+                out["badges_decoded"] = _decode_flags(flags)
+            pub = data.get("public_flags")
+            if isinstance(pub, int):
+                out["public_flags_decoded"] = _decode_flags(pub)
+        else:
+            out["lookup_error"] = f"status {r.status_code}"
+    except Exception as e:
+        out["lookup_error"] = str(e)
+
+    # lanyard — presence if user is in the lanyard guild
+    try:
+        r = S.get(f"https://api.lanyard.rest/v1/users/{sf}", timeout=TIMEOUT)
+        if r.status_code == 200:
+            j = r.json()
+            if j.get("success"):
+                out["lanyard"] = j.get("data")
+    except Exception:
+        pass
+
+    return out
+
+
+def discord_invite_scan(code: str) -> dict[str, Any]:
+    """unauth invite lookup — leaks guild id, name, members, channel, inviter."""
+    code = code.strip().rsplit("/", 1)[-1]
+    out: dict[str, Any] = {"code": code}
+    try:
+        r = S.get(
+            f"https://discord.com/api/v10/invites/{code}",
+            params={"with_counts": "true", "with_expiration": "true"},
+            timeout=TIMEOUT,
+        )
+        if r.status_code == 200:
+            out["invite"] = r.json()
+            g = (out["invite"].get("guild") or {})
+            if g.get("id"):
+                out["guild_snowflake"] = decode_snowflake(int(g["id"]))
+        else:
+            out["error"] = f"status {r.status_code}"
+    except Exception as e:
+        out["error"] = str(e)
+    return out
+
+
 # ---------- wayback ----------
 
 def wayback_scan(target: str, limit: int = 50) -> dict[str, Any]:
@@ -494,6 +606,10 @@ def auto(target: str) -> dict[str, Any]:
         return {"type": "ip", **ip_scan(t)}
     if t.startswith("+") and PHONE_RE.match(t):
         return {"type": "phone", **phone_scan(t)}
+    if t.isdigit() and 17 <= len(t) <= 20:
+        return {"type": "discord", **discord_user_scan(t)}
+    if "discord.gg/" in t or t.startswith("discord-"):
+        return {"type": "discord-invite", **discord_invite_scan(t)}
     if DOMAIN_RE.match(t):
         return {"type": "domain", **domain_scan(t)}
     return {"type": "username", **username_scan(t)}
@@ -609,6 +725,72 @@ def print_github(d: dict) -> None:
             print(f"  {C.GRN}+{C.R} {r['name']:<30} {lang:<14} {star:<6} {r['url']}")
 
 
+def print_discord(d: dict) -> None:
+    banner(f"discord user: {d['id']}")
+    if "error" in d:
+        warn(d["error"])
+        return
+    sf = d.get("snowflake") or {}
+    kv("created_at", sf.get("created_at"))
+    kv("worker", sf.get("worker_id"))
+    kv("process", sf.get("process_id"))
+    kv("increment", sf.get("increment"))
+    lu = d.get("lookup") or {}
+    if lu:
+        kv("username", lu.get("username"))
+        kv("global_name", lu.get("global_name"))
+        kv("discriminator", lu.get("discriminator"))
+        kv("id", lu.get("id"))
+        kv("avatar", (lu.get("avatar") or {}).get("link") if isinstance(lu.get("avatar"), dict) else lu.get("avatar"))
+        kv("banner", (lu.get("banner") or {}).get("link") if isinstance(lu.get("banner"), dict) else lu.get("banner"))
+        kv("accent", lu.get("accent_color"))
+        kv("bot", lu.get("bot"))
+    for b in d.get("badges_decoded") or []:
+        hit(f"badge: {b}")
+    for b in d.get("public_flags_decoded") or []:
+        hit(f"flag: {b}")
+    la = d.get("lanyard") or {}
+    if la:
+        print(f"\n  {C.B}lanyard presence{C.R}")
+        du = la.get("discord_user") or {}
+        kv("status", la.get("discord_status"))
+        kv("username", du.get("username"))
+        for a in la.get("activities") or []:
+            hit(f"activity: {a.get('name')} — {a.get('details') or ''}")
+        if la.get("spotify"):
+            sp = la["spotify"]
+            hit(f"spotify: {sp.get('song')} — {sp.get('artist')}")
+    if d.get("lookup_error"):
+        warn(d["lookup_error"])
+
+
+def print_discord_invite(d: dict) -> None:
+    banner(f"discord invite: {d['code']}")
+    if "error" in d:
+        warn(d["error"])
+        return
+    inv = d.get("invite") or {}
+    g = inv.get("guild") or {}
+    kv("guild_id", g.get("id"))
+    kv("guild_name", g.get("name"))
+    kv("description", g.get("description"))
+    kv("members", inv.get("approximate_member_count"))
+    kv("online", inv.get("approximate_presence_count"))
+    kv("features", ", ".join(g.get("features") or []))
+    kv("verif_level", g.get("verification_level"))
+    kv("vanity", g.get("vanity_url_code"))
+    kv("nsfw", g.get("nsfw_level"))
+    kv("boost_tier", g.get("premium_tier"))
+    ch = inv.get("channel") or {}
+    kv("channel", f"{ch.get('name')} (id={ch.get('id')})")
+    inviter = inv.get("inviter") or {}
+    if inviter:
+        kv("inviter", f"{inviter.get('username')} (id={inviter.get('id')})")
+    kv("expires", inv.get("expires_at"))
+    gsf = d.get("guild_snowflake") or {}
+    kv("guild_created", gsf.get("created_at"))
+
+
 def print_wayback(d: dict) -> None:
     banner(f"wayback: {d['target']}  ({d.get('count', 0)} snapshots)")
     for s in (d.get("snapshots") or [])[:40]:
@@ -619,13 +801,15 @@ def print_wayback(d: dict) -> None:
 
 
 PRINTERS = {
-    "username": print_username,
-    "email":    print_email,
-    "domain":   print_domain,
-    "ip":       print_ip,
-    "phone":    print_phone,
-    "github":   print_github,
-    "wayback":  print_wayback,
+    "username":       print_username,
+    "email":          print_email,
+    "domain":         print_domain,
+    "ip":             print_ip,
+    "phone":          print_phone,
+    "github":         print_github,
+    "discord":        print_discord,
+    "discord-invite": print_discord_invite,
+    "wayback":        print_wayback,
 }
 
 
@@ -640,6 +824,11 @@ def main() -> int:
     for name in ("username", "email", "domain", "ip", "phone", "github"):
         sp = sub.add_parser(name)
         sp.add_argument("target")
+
+    dc = sub.add_parser("discord", help="discord user id (snowflake) lookup")
+    dc.add_argument("target")
+    di = sub.add_parser("discord-invite", help="invite code or discord.gg/<code> url")
+    di.add_argument("target")
 
     wb = sub.add_parser("wayback")
     wb.add_argument("target")
@@ -657,6 +846,8 @@ def main() -> int:
         "ip":       lambda: ("ip",       ip_scan(args.target)),
         "phone":    lambda: ("phone",    phone_scan(args.target)),
         "github":   lambda: ("github",   github_scan(args.target)),
+        "discord":  lambda: ("discord",  discord_user_scan(args.target)),
+        "discord-invite": lambda: ("discord-invite", discord_invite_scan(args.target)),
         "wayback":  lambda: ("wayback",  wayback_scan(args.target, args.limit)),
         "all":      lambda: (auto(args.target).get("type", "username"), auto(args.target)),
     }
